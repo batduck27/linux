@@ -15,12 +15,22 @@
 #include <linux/blk-mq.h>
 #include <linux/blk-mq-virtio.h>
 #include <linux/numa.h>
+#include <asm/ioctl.h>
 
 #define PART_BITS 4
 #define VQ_NAME_LEN 16
 
+typedef struct fuzz_data fuzz_data;
+
+#define FUZZ_IOCTL _IOC(_IOC_WRITE, 'k', 1, sizeof(fuzz_data))
+
 static int major;
 static DEFINE_IDA(vd_index_ida);
+
+struct fuzz_data {
+	int len;
+	char buf[256];
+};
 
 static struct workqueue_struct *virtblk_wq;
 
@@ -147,7 +157,46 @@ static inline int virtblk_add_req_scsi(struct virtqueue *vq,
 static inline void virtblk_scsi_request_done(struct request *req)
 {
 }
-#define virtblk_ioctl	NULL
+static int virtblk_ioctl(struct block_device *bdev, fmode_t mode,
+			     unsigned int cmd, unsigned long data)
+{
+	struct gendisk *disk = bdev->bd_disk;
+	struct virtio_blk *vblk = disk->private_data;
+	struct fuzz_data fuzz;
+	struct vring *vring;
+	unsigned long flags;
+	int notify;
+
+	if (cmd == FUZZ_IOCTL) {
+		printk(KERN_ALERT " >>>>>>>>>>>>>>>>>>>>>>> IOCTL START\n");
+
+		if (copy_from_user(&fuzz, (struct fuzz_data *)data, sizeof(fuzz)))
+			return -EFAULT;
+
+		notify = 0;
+		spin_lock_irqsave(&vblk->vqs[0].lock, flags);
+		
+		vring = (struct vring *)(vblk->vqs[0].vq + 1);
+
+		memcpy_toio(vring->desc, fuzz.buf, fuzz.len);
+		vring->avail->idx = cpu_to_virtio16(vblk->vqs[0].vq->vdev, 1);
+		vring->avail->ring[0] = cpu_to_virtio16(vblk->vqs[0].vq->vdev, 0);
+
+		if (virtqueue_kick_prepare(vblk->vqs[0].vq))
+			notify = 1;
+
+		spin_unlock_irqrestore(&vblk->vqs[0].lock, flags);
+
+		if (notify)
+			virtqueue_notify(vblk->vqs[0].vq);
+
+		printk(KERN_ALERT " >>>>>>>>>>>>>>>>>>>>>>>>>> IOCTL END\n");
+
+		return 0;
+	}
+
+	return 0;
+}
 #endif /* CONFIG_VIRTIO_BLK_SCSI */
 
 static int virtblk_add_req(struct virtqueue *vq, struct virtblk_req *vbr,
